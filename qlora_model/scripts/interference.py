@@ -15,7 +15,7 @@ from peft import PeftModel
 import torch
 
 # Paths
-BASE_MODEL = "meta-llama/Llama-2-7b-hf"  # or "mistralai/Mistral-7B-v0.1"
+BASE_MODEL = "mistralai/Mistral-7B-Instruct-v0.1"  # or "mistralai/Mistral-7B-v0.1"
 ADAPTER_DIR = "../model_weights/"
 
 # Load tokenizer + base model
