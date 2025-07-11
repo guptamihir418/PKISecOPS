@@ -1,0 +1,14 @@
+requests
+cryptography
+pyyaml
+transformers
+datasets
+peft
+bitsandbytes
+langchain-community
+langchain
+sentence-transformers   
+faiss-cpu
+bs4
+uvicorn
+fastapi
