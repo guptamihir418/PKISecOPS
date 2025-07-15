@@ -2,55 +2,103 @@
 import os
 import json
 import random
-
 LABELED_DIR = "../../cert_data/labeled"
-OUTPUT_FILE = "../training_data/qa_pairs.json"
+DATA_DIR = "../data"
+TRAIN_FILE = os.path.join(DATA_DIR, "train.jsonl")
+VAL_FILE = os.path.join(DATA_DIR, "val.jsonl")
 
-qa_pairs = []
-
-# Diverse ways to ask about cert flaws
-QUESTION_TEMPLATES = [
-    "Does this certificate have any issues?",
-    "What problems, if any, does this certificate have?",
-    "List all security flaws found in this certificate.",
-    "Are there any weaknesses or policy violations in this certificate?",
-    "Does this certificate violate any PKI best practices?",
-    "Can you identify compliance issues with this certificate?"
-]
+# Create data directory if it doesn't exist
+os.makedirs(DATA_DIR, exist_ok=True)
 
 files = [f for f in os.listdir(LABELED_DIR) if f.endswith(".json")]
 print(f"Found {len(files)} labeled cert files.")
 
-for fname in files:
-    try:
-        with open(os.path.join(LABELED_DIR, fname), "r") as f:
-            data = json.load(f)
+# Shuffle files for random split
+random.seed(200)  # Set seed for reproducibility
+random.shuffle(files)
 
-        flaws = data.get("flaws", [])
-        pem = data.get("pem", "")
+# Split files into training (95%) and validation (5%) sets
+split_idx = int(len(files) * 0.95)
+train_files = files[:split_idx]
+val_files = files[split_idx:]
 
-        # Randomly pick a question phrasing for this example
-        question = random.choice(QUESTION_TEMPLATES)
+print(f"Split: {len(train_files)} files for training, {len(val_files)} files for validation")
 
-        if flaws:
-            answer = f"Yes, it has these issues: {', '.join(flaws)}."
-        else:
-            answer = "No, this certificate does not have any known issues."
+train_count = 0
+val_count = 0
 
-        qa_pairs.append({
-            "question": question,
-            "context": pem,
-            "answer": answer
-        })
+# Process training files
+with open(TRAIN_FILE, "w") as train_file:
+    for fname in train_files:
+        try:
+            with open(os.path.join(LABELED_DIR, fname), "r") as f:
+                data = json.load(f)
 
-    except Exception as e:
-        print(f"Failed on {fname}: {e}")
+            flaws = data.get("flaws", [])
+            pem = data.get("pem", "")
 
-print(f"Generated {len(qa_pairs)} diversified Q&A pairs.")
+            # Format flaws exactly as your example
+            if flaws:
+                assistant_content = f"{{'flaws': {json.dumps(flaws)}}}"
+            else:
+                assistant_content = "{'flaws': []}"
 
-# Write to output file
-os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-with open(OUTPUT_FILE, "w") as out:
-    json.dump(qa_pairs, out, indent=2)
+            # Each record as required by Mistral instruct
+            record = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": pem
+                    },
+                    {
+                        "role": "assistant",
+                        "content": assistant_content
+                    }
+                ]
+            }
 
-print(f"Saved Q&A pairs to {OUTPUT_FILE}")
+            train_file.write(json.dumps(record) + "\n")
+            train_count += 1
+
+        except Exception as e:
+            print(f"Failed on {fname}: {e}")
+
+# Process validation files
+with open(VAL_FILE, "w") as val_file:
+    for fname in val_files:
+        try:
+            with open(os.path.join(LABELED_DIR, fname), "r") as f:
+                data = json.load(f)
+
+            flaws = data.get("flaws", [])
+            pem = data.get("pem", "")
+
+            # Format flaws exactly as your example
+            if flaws:
+                assistant_content = f"{{\"flaws\": {json.dumps(flaws)}}}"
+            else:
+                assistant_content = "{\"flaws\": []}"
+
+            # Each record as required by Mistral instruct
+            record = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": pem
+                    },
+                    {
+                        "role": "assistant",
+                        "content": assistant_content
+                    }
+                ]
+            }
+
+            val_file.write(json.dumps(record) + "\n")
+            val_count += 1
+
+        except Exception as e:
+            print(f"Failed on validation file {fname}: {e}")
+
+print(f"✅ Generated {train_count} training and {val_count} validation Q&A pairs")
+print(f"   Training data saved to: {TRAIN_FILE}")
+print(f"   Validation data saved to: {VAL_FILE}")

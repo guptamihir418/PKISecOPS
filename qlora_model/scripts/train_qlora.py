@@ -3,116 +3,143 @@
 ================================================================================
 train_qlora.py
 
-Fine-tunes Mistral-7B with QLoRA on your structured X.509 cert Q&A pairs.
-
-- Loads JSON data from training_data/qa_pairs.json
-- Tokenizes question+context as input, expects answer as label
-- Trains with PEFT QLoRA on bitsandbytes 4-bit quantized model
-- Saves adapter weights in safetensors format
+Fine-tunes Mistral-7B on X.509 flaw detection using QLoRA.
+Inspired by your large DDP project, but built cleanly with torch DataLoader.
 
 Author: Mihir Gupta, 2025
-For AI Certificate Service POC (PKISecOPS project)
 ================================================================================
 """
 
 import json
-from datasets import Dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer
-from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
 import torch
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from datasets import load_dataset
+from tqdm import tqdm
 
 # =================================================================================
-# Paths & Hyperparams
+# Configuration
 # =================================================================================
-DATA_FILE = "../training_data/qa_pairs.json"
-MODEL_OUT_DIR = "../model_weights/"
-
-MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.1"
-BATCH_SIZE = 4
-EPOCHS = 3
-LEARNING_RATE = 2e-4
-
-# =================================================================================
-# 1️⃣ Load your JSON data
-# =================================================================================
-with open(DATA_FILE, "r") as f:
-    data = json.load(f)
-
-records = [{
-    "prompt": f"Question: {item['question']}\nCertificate:\n{item['context']}",
-    "response": item["answer"]
-} for item in data]
-
-dataset = Dataset.from_list(records)
+MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.1"
+TRAIN_JSONL = "../data/train.jsonl"
+RUN_DIR = "../model_weights"
+BATCH_SIZE = 2
+MAX_LENGTH = 2048
+LR = 2e-4
+WEIGHT_DECAY = 0.01
+MAX_EPOCHS = 3
+GRAD_CLIP = 1.0
 
 # =================================================================================
-# 2️⃣ Load tokenizer & quantized base model for QLoRA
+# Load dataset
 # =================================================================================
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+dataset = load_dataset('json', data_files=TRAIN_JSONL, split='train')
+
+# =================================================================================
+# Tokenizer
+# =================================================================================
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 tokenizer.pad_token = tokenizer.eos_token
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    load_in_4bit=True,
-    device_map="auto"
-)
-model = prepare_model_for_kbit_training(model)
+# =================================================================================
+# Collate function (like your inspiration's build_data_loader)
+# =================================================================================
+def collate_fn(batch):
+    prompts = []
+    for f in batch:
+        user_text = f["messages"][0]["content"]
+        assistant_text = f["messages"][1]["content"]
+        # Wrap in instruction format for Mistral
+        prompts.append(f"<s>[INST] {user_text} [/INST] {assistant_text}</s>")
+
+    encodings = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=MAX_LENGTH
+    )
+    encodings["labels"] = encodings["input_ids"].clone()
+    return encodings
+
+loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
 # =================================================================================
-# 3️⃣ Prepare LoRA adapters
+# Load quantized model with LoRA
 # =================================================================================
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    quantization_config=bnb_config,
+    device_map="auto"
+)
+
+model = prepare_model_for_kbit_training(model)
+
 lora_config = LoraConfig(
-    r=8,
-    lora_alpha=16,
+    r=16,
+    lora_alpha=32,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     lora_dropout=0.05,
     bias="none",
-    task_type="CAUSAL_LM"
+    task_type="CAUSAL_LM",
 )
+
 model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
 
 # =================================================================================
-# 4️⃣ Tokenize dataset
+# Optimizer and scheduler
 # =================================================================================
-def tokenize_function(examples):
-    return tokenizer(
-        examples["prompt"],
-        text_target=examples["response"],
-        truncation=True,
-        padding="max_length",
-        max_length=512
-    )
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS * len(loader))
 
-tokenized_dataset = dataset.map(tokenize_function, batched=True)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.train()
 
 # =================================================================================
-# 5️⃣ Set up Trainer
+# Training loop
 # =================================================================================
-training_args = TrainingArguments(
-    output_dir=MODEL_OUT_DIR,
-    per_device_train_batch_size=BATCH_SIZE,
-    num_train_epochs=EPOCHS,
-    learning_rate=LEARNING_RATE,
-    fp16=True,
-    save_total_limit=2,
-    save_strategy="epoch",
-    logging_steps=10,
-    report_to="none"
-)
+for epoch in range(MAX_EPOCHS):
+    epoch_loss = 0.0
+    progress = tqdm(loader, desc=f"Epoch {epoch+1}/{MAX_EPOCHS}")
 
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=tokenized_dataset
-)
+    for batch in progress:
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
+        loss = outputs.loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        optimizer.step()
+        scheduler.step()
+
+        loss_val = loss.item()
+        epoch_loss += loss_val
+        progress.set_postfix(loss=loss_val)
+
+    avg_epoch_loss = epoch_loss / len(loader)
+    print(f"✅ Epoch {epoch+1} avg loss: {avg_epoch_loss:.4f}")
 
 # =================================================================================
-# 6️⃣ Train!
+# Save only LoRA adapter weights
 # =================================================================================
-trainer.train()
-
-# =================================================================================
-# 7️⃣ Save final adapter weights
-# =================================================================================
-model.save_pretrained(MODEL_OUT_DIR, safe_serialization=True)
-print(f"✅ Done! Saved trained QLoRA adapter weights to {MODEL_OUT_DIR}")
+print(f"✅ Saving model adapter weights to {RUN_DIR}")
+model.save_pretrained(RUN_DIR, safe_serialization=True)
+tokenizer.save_pretrained(RUN_DIR)
+print("✅ Training complete!")

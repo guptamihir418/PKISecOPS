@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 # Define paths
-BASE_DIR = Path('/Users/mihirgupta/Desktop/Projects/PKISecOPS')
+BASE_DIR = Path('/home/ubuntu/PKISecOPS')
 LABELED_DIR = BASE_DIR / 'cert_data' / 'labeled'
 SYNTHETIC_DIR = BASE_DIR / 'cert_data' / 'synthetic'
 
